@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     if args.opr == "train" or (args.opr == "train_sync" and args.reanalyze_actors > 1):
         ray.init(num_gpus=args.num_gpus, num_cpus=args.num_cpus,
-                 object_store_memory=args.object_store_memory)
+                 object_store_memory=20 * 1024 * 1024 * 1024)
 
     # seeding random iterators
     set_seed(args.seed)

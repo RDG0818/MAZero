@@ -49,7 +49,7 @@ class GameConfig(BaseConfig):
             use_feature_norm=True,
         )
 
-    def new_game(self, seed=None, save_video=False, **kwargs):
+    def new_game(self, seed=None, save_video=True, **kwargs):
         args = type("Config", (object,), {
             "map_name": self.env_name,
             "use_stacked_frames": False,

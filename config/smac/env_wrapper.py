@@ -7,7 +7,7 @@ from .mappo_smac.StarCraft2_Env import StarCraft2Env
 
 class SMACWrapper(Game):
 
-    def __init__(self, env: StarCraft2Env, save_video=False):
+    def __init__(self, env: StarCraft2Env, save_video=True):
         """SMAC Wrapper
 
         Parameters
