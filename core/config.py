@@ -83,7 +83,7 @@ def parse_args(args):
                         help="Dirichlet alpha of exploration noise in MCTS. (default: %(default)s)")
     groups.add_argument("--root_exploration_fraction", type=float, default=0.25,
                         help="Noisy fraction. (default: %(default)s)")
-    groups.add_argument("--sampled_action_times", type=int, default=5,
+    groups.add_argument("--sampled_action_times", type=int, default=1,
                         help="Sampled times per Node (default: %(default)s)")
     groups.add_argument("--mcts_rho", type=float, default=0.75, 
                         help="Quantile rho in subtree value estimation (default: %(default)s)")

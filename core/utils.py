@@ -320,6 +320,8 @@ def select_action(visit_counts, temperature=1, deterministic=True, np_random: np
 
 
 def eps_greedy_action(greedy_action, legal_action_mask, eps):
+    if not isinstance(greedy_action, np.ndarray):
+        greedy_action = np.array([greedy_action]) # Make it a 1-element array
     greedy_action = torch.from_numpy(greedy_action)
     legal_action_mask = torch.from_numpy(legal_action_mask)
 

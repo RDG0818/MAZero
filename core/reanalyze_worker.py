@@ -118,7 +118,15 @@ class ReanalyzeWorker(object):
             # concat the output slices after model inference
             legal_actions_lst = np.asarray(legal_actions_lst)
 
-            search_results = SampledMCTS(self.config, self.np_random).batch_search(self.model, network_output, legal_actions_lst, self.device, True, 1.0)
+            search_results = SampledMCTS(self.config, self.np_random).batch_search(
+                model=self.model, 
+                network_output=network_output, 
+                current_agent_idx=0, factor=None, 
+                true_num_agents=self.config.num_agents, 
+                legal_actions_lst=legal_actions_lst, 
+                device=self.device, 
+                add_noise=True, 
+                sampled_tau=1.0)
             value_lst = search_results.value.flatten()
         # use the predicted values
         elif self.config.use_pred_value:
@@ -233,7 +241,6 @@ class ReanalyzeWorker(object):
 
             # prepare the corresponding observations for predict policy
             game_obs = game.obs(state_index, K)
-
             for current_index in range(state_index, state_index + K + 1):
                 if current_index < traj_len:
                     policy_mask.append(True)
@@ -246,7 +253,6 @@ class ReanalyzeWorker(object):
                     legal_actions_lst.append(game.legal_actions[0])
                     obs = self.zero_obs
                 policy_obs_lst.append(obs)
-
         # (2) generate target policy from reanalyzing
         policy_obs_lst = prepare_observation_lst(policy_obs_lst, self.config.image_based)
         if self.config.image_based:
@@ -258,28 +264,102 @@ class ReanalyzeWorker(object):
 
         legal_actions_lst = np.asarray(legal_actions_lst).reshape(B * (K + 1), N, A)
 
-        search_results = SampledMCTS(self.config, self.np_random).batch_search(
-            self.model, network_output, legal_actions_lst, self.device, add_noise=True, sampled_tau=1.0)
 
-        batch_sampled_actions_re, batch_sampled_masks_re = concat_with_zero_padding(search_results.sampled_actions, C)
-        batch_sampled_masks_re[~np.asarray(policy_mask)] = False
+        #####################################
 
-        batch_sampled_visit_counts_re, _ = concat_with_zero_padding(search_results.sampled_visit_count, C)
-        batch_sampled_policies_re = batch_sampled_visit_counts_re / self.config.num_simulations
-        batch_sampled_policies_re[~np.asarray(policy_mask)] = 0.
-        assert batch_sampled_policies_re[~batch_sampled_masks_re].sum() == 0
+        B_prime = policy_obs_tensor.shape[0]
 
-        batch_sampled_imp_ratio, _ = concat_with_zero_padding(search_results.sampled_imp_ratio, C)
-        batch_sampled_imp_ratio[~batch_sampled_masks_re] = 0.
+        actions = np.full((B_prime, N), -1, dtype=np.int32)
+        probs = np.zeros((B_prime, 1), dtype=np.float32)
+        values = np.zeros((B_prime, 1), dtype=np.float32)
+        agent_policy_dist = [[None for _ in range(N)] for _ in range(B_prime)]
+        current_actions = np.zeros_like(actions)
 
-        batch_sampled_qvalues_re, _ = concat_with_zero_padding(search_results.sampled_qvalues, C)
-        batch_root_mcts_values_re = np.expand_dims(search_results.value, axis=-1)
-        batch_root_pred_values_re = network_output.value
+        for agent_idx in range(N):
 
+            factor = None
+            if agent_idx > 0:
+                factor = current_actions[:, :agent_idx].copy()
+
+            search_results = SampledMCTS(self.config, self.np_random).batch_search(
+                model=self.model, 
+                network_output=network_output,
+                current_agent_idx=agent_idx,
+                factor=factor,
+                true_num_agents=N,
+                legal_actions_lst=legal_actions_lst, 
+                device=self.device,
+                add_noise=True,
+                sampled_tau=1.0 
+            )
+
+            if agent_idx == 0: agent0_root_value = search_results.value.reshape(B_prime, 1)
+
+            for s_idx in range(B_prime):
+
+                sampled_actions = search_results.sampled_actions[s_idx]
+                sampled_visits = search_results.sampled_visit_count[s_idx]
+                marginal_visits = search_results.marginal_visit_count[s_idx, 0, :]
+                legal_actions = legal_actions_lst[s_idx, agent_idx, :]
+
+                agent_action = 0
+
+                if sampled_actions.size > 0 and np.sum(sampled_visits) > 0:
+                    if np.sum(marginal_visits) > 0:
+                        agent_action = np.argmax(marginal_visits * legal_actions)
+                    else:
+                        legal_indices = np.where(legal_actions == 1)[0]
+                        if legal_indices.size > 0: agent_action = self.np_random.choice(legal_indices)
+                else:
+                    legal_indices = np.where(legal_actions == 1)[0]
+                    if legal_indices.size > 0: agent_action = self.np_random.choice(legal_indices)
+                
+                current_actions[s_idx, agent_idx] = agent_action
+
+                if np.sum(marginal_visits) > 0:
+                    agent_policy_dist[s_idx][agent_idx] = marginal_visits / np.sum(marginal_visits)
+                else:
+                    num_legal = np.sum(legal_actions)
+                    if num_legal > 0: agent_policy_dist[s_idx][agent_idx] = legal_actions / num_legal
+                    else:
+                        dummy_policy = np.zeros(A)
+                        if A > 0: dummy_policy[0] = 1.0
+                        agent_policy_dist[s_idx][agent_idx] = dummy_policy
+
+        actions = current_actions
+
+        batch_sampled_actions_re = actions.reshape(B_prime, 1, N)
+
+        for s_idx in range(B_prime):
+            prob_prod = 1.0
+            for agent_idx_turn in range(N): # N is true_num_agents
+                # Get the policy distribution omega_k stored from this agent's MCTS
+                policy_dist_k = agent_policy_dist[s_idx][agent_idx_turn] 
+                chosen_action_k = actions[s_idx, agent_idx_turn]
+                
+                if policy_dist_k is not None: # Should have been filled
+                    prob_prod *= policy_dist_k[chosen_action_k]
+                elif A > 0: # Fallback if policy_dist_k was somehow None (should be prevented)
+                    prob_prod *= (1.0 / A) 
+            probs[s_idx, 0] = prob_prod
+        batch_sampled_policies_re = probs # Shape (B_prime, 1)
+
+        batch_sampled_imp_ratio_re = np.ones((B_prime, 1), dtype=np.float32)
+
+        batch_sampled_masks_re = np.asarray(policy_mask).reshape(B_prime, 1).astype(np.bool_)
+
+        batch_sampled_qvalues_re = agent0_root_value
+
+        batch_root_mcts_values_re = agent0_root_value
+
+        if network_output.value.ndim == 1: # If it's (B_prime,)
+             batch_root_pred_values_re = network_output.value.reshape(B_prime, 1)
+        else: # Assuming it's (B_prime, 1) or needs conversion if categorical
+             batch_root_pred_values_re = network_output.value 
         return (
             batch_sampled_actions_re,
             batch_sampled_policies_re,
-            batch_sampled_imp_ratio,
+            batch_sampled_imp_ratio_re,
             batch_sampled_masks_re,
             batch_sampled_qvalues_re,
             batch_root_mcts_values_re,
@@ -333,7 +413,8 @@ class ReanalyzeWorker(object):
         for i in range(len(inputs_batch)):
             inputs_batch[i] = np.asarray(inputs_batch[i])
 
-        # (3) obtain the context of value targets
+        # (3) obtain the context
+
         if self.config.use_reanalyze_value:
             batch_rewards, batch_values = self._prepare_reward_value_re(indices_lst, game_lst, game_pos_lst, transitions_collected)
         else:
@@ -357,6 +438,7 @@ class ReanalyzeWorker(object):
         batch_root_pred_values = np.empty((0, 1))
 
         # (4) obtain the context of reanalyzed policy targets
+
         if re_num > 0:
             (
                 batch_sampled_actions_re,
@@ -367,6 +449,7 @@ class ReanalyzeWorker(object):
                 batch_root_mcts_values_re,
                 batch_root_pred_values_re
             ) = self._prepare_policy_re(game_lst[:re_num], game_pos_lst[:re_num])
+
             batch_sampled_actions = np.concatenate([batch_sampled_actions, batch_sampled_actions_re])
             batch_sampled_policies = np.concatenate([batch_sampled_policies, batch_sampled_policies_re])
             batch_sampled_imp_ratio = np.concatenate([batch_sampled_imp_ratio, batch_sampled_imp_ratio_re])
@@ -378,6 +461,7 @@ class ReanalyzeWorker(object):
         # (5) obtain the context of non-reanalyzed policy targets
         if re_num < B:
             raise NotImplementedError
+
 
         # (6) compute and normalize advantage
         batch_sampled_adv = batch_sampled_qvalues - batch_root_pred_values
@@ -421,25 +505,108 @@ class ReanalyzeWorker(object):
             network_output = self.model.initial_inference(policy_obs_tensor)
 
         legal_actions_lst = game.legal_actions
+        print("HERE 7")
+        num_game_steps = len(game) # This is B_prime from _prepare_policy_re context
+        true_num_agents = self.config.num_agents # N
+        action_space_sz = self.config.action_space_size # A
 
-        search_results = SampledMCTS(self.config, self.np_random).batch_search(
-            self.model, network_output, legal_actions_lst, self.device, add_noise=True, sampled_tau=1.0)
+        mcts_handler = SampledMCTS(self.config, self.np_random)
 
-        C = self.config.sampled_action_times
+        # --- Arrays to store final reanalyzed results for each step in the game ---
+        # Shape: (num_game_steps, true_num_agents)
+        reanalyzed_chosen_joint_actions = np.full((num_game_steps, true_num_agents), -1, dtype=np.int32)
 
-        batch_sampled_actions, batch_sampled_masks = concat_with_zero_padding(search_results.sampled_actions, C)
-        batch_sampled_visit_counts, _ = concat_with_zero_padding(search_results.sampled_visit_count, C)
-        batch_sampled_policies = batch_sampled_visit_counts / self.config.num_simulations
-        batch_sampled_qvalues, _ = concat_with_zero_padding(search_results.sampled_qvalues, C)
-        batch_root_values = np.asarray(search_results.value)
+        # Shape: (num_game_steps, 1) - policy prob for the chosen joint action
+        reanalyzed_policy_probs_for_chosen_actions = np.zeros((num_game_steps, 1), dtype=np.float32)
 
-        # update game history
-        game.model_indices = np.array([self.last_model_index for _ in range(len(game))])
-        game.sampled_actions = batch_sampled_actions
-        game.sampled_policies = batch_sampled_policies
-        game.sampled_padding_masks = batch_sampled_masks
-        game.sampled_qvalues = batch_sampled_qvalues
-        game.root_values = batch_root_values
+        # Shape: (num_game_steps, 1) - V_mcts(s) from agent 0's MCTS
+        reanalyzed_root_mcts_values_agent0 = np.zeros((num_game_steps, 1), dtype=np.float32)
+
+        # Store per-agent MCTS policy distributions for each step
+        # Structure: list (num_game_steps items) of lists (N_true items) of np.array (A items)
+        reanalyzed_per_agent_policy_dist = [[None for _ in range(true_num_agents)] for _ in range(num_game_steps)]
+
+        # Temporary array to build joint actions sequentially for all game steps
+        current_game_sequential_actions = np.zeros_like(reanalyzed_chosen_joint_actions)
+        print("HERE 8")
+        # === SEQUENTIAL MCTS FOR EACH AGENT, FOR ALL STATES IN THE GAME HISTORY ===
+        for agent_idx_turn in range(true_num_agents):
+            factor_for_current_agent = None
+            if agent_idx_turn > 0:
+                factor_for_current_agent = current_game_sequential_actions[:, :agent_idx_turn].copy()
+
+            # network_output is from model.initial_inference(policy_obs_tensor) for all game steps
+            # legal_actions_lst is also for all game steps, shape (num_game_steps, N, A)
+            agent_k_batched_search_output = mcts_handler.batch_search(
+                model=self.model,       # Use self.model (latest reanalyze model)
+                network_output=network_output, 
+                current_agent_idx=agent_idx_turn,
+                factor=factor_for_current_agent,
+                true_num_agents=true_num_agents,
+                legal_actions_lst=legal_actions_lst, 
+                device=self.device,
+                add_noise=True,        # Reanalysis should use noise
+                sampled_tau=1.0        # Target policy tau
+            )
+            print("HERE 9")
+            if agent_idx_turn == 0:
+                reanalyzed_root_mcts_values_agent0 = agent_k_batched_search_output.value.reshape(num_game_steps, 1)
+
+            # For each state (step) in the game history
+            for s_idx in range(num_game_steps): 
+                env_agent_marginal_visits = agent_k_batched_search_output.marginal_visit_count[s_idx, 0, :] # Shape (A,)
+                env_agent_legal_actions_at_root = legal_actions_lst[s_idx, agent_idx_turn, :]
+
+                chosen_action_for_this_agent_state = 0 # Default
+                current_agent_policy_dist_for_s_idx = np.zeros(action_space_sz, dtype=np.float32)
+
+                if np.sum(env_agent_marginal_visits) > 0:
+                    current_agent_policy_dist_for_s_idx = env_agent_marginal_visits / np.sum(env_agent_marginal_visits)
+                    masked_visits = env_agent_marginal_visits * env_agent_legal_actions_at_root
+                    if np.sum(masked_visits) > 0:
+                        chosen_action_for_this_agent_state = np.argmax(masked_visits)
+                    else: 
+                        legal_indices = np.where(env_agent_legal_actions_at_root == 1)[0]
+                        if legal_indices.size > 0: chosen_action_for_this_agent_state = self.np_random.choice(legal_indices)
+                else: 
+                    legal_indices = np.where(env_agent_legal_actions_at_root == 1)[0]
+                    if legal_indices.size > 0:
+                        chosen_action_for_this_agent_state = self.np_random.choice(legal_indices)
+                        current_agent_policy_dist_for_s_idx = env_agent_legal_actions_at_root / np.sum(env_agent_legal_actions_at_root)
+                    elif action_space_sz > 0: 
+                        current_agent_policy_dist_for_s_idx[0] = 1.0
+
+                current_game_sequential_actions[s_idx, agent_idx_turn] = chosen_action_for_this_agent_state
+                reanalyzed_per_agent_policy_dist[s_idx][agent_idx_turn] = current_agent_policy_dist_for_s_idx
+
+        print("HERE 10")
+        # All agents' actions decided for all game steps
+        reanalyzed_chosen_joint_actions = current_game_sequential_actions
+
+        # Calculate the MCTS policy probability for each chosen joint action
+        for s_idx in range(num_game_steps):
+            prob_prod = 1.0
+            for agent_idx_turn in range(true_num_agents):
+                agent_policy_dist_s = reanalyzed_per_agent_policy_dist[s_idx][agent_idx_turn]
+                chosen_agent_action_s = reanalyzed_chosen_joint_actions[s_idx, agent_idx_turn]
+                if agent_policy_dist_s is not None:
+                    prob_prod *= agent_policy_dist_s[chosen_agent_action_s]
+                elif action_space_sz > 0:
+                    prob_prod *= (1.0 / action_space_sz)
+            reanalyzed_policy_probs_for_chosen_actions[s_idx, 0] = prob_prod
+        print("HERE 11")
+        game.model_indices = np.array([self.last_model_index for _ in range(num_game_steps)])
+        game.sampled_actions = [action.reshape(1, true_num_agents) for action in reanalyzed_chosen_joint_actions]
+        game.sampled_policies = [policy_prob.reshape(1) for policy_prob in reanalyzed_policy_probs_for_chosen_actions]
+        game.sampled_padding_masks = [np.array([True], dtype=np.bool_) for _ in range(num_game_steps)]
+        game.sampled_qvalues = [q_val.reshape(1) for q_val in reanalyzed_root_mcts_values_agent0]
+        game.root_values = [val[0] for val in reanalyzed_root_mcts_values_agent0]
+        if network_output.value.ndim == 2 and network_output.value.shape[1] == 1:
+            game.pred_values = [val[0] for val in network_output.value]
+        elif network_output.value.ndim == 1: # if it was (num_game_steps,)
+             game.pred_values = network_output.value.tolist()
+        else:
+            print("Warning: pred_values might not be updated correctly if network_output.value is not scalar per step.")
 
         return (game_id, game)
 
@@ -470,6 +637,7 @@ class RemoteReanalyzeWorker(ReanalyzeWorker):
         return self.beta_schedule.value(trained_steps)
 
     def run_loop(self):
+
         start = False
         while True:
             # waiting for start signal
@@ -479,13 +647,16 @@ class RemoteReanalyzeWorker(ReanalyzeWorker):
                 if start:
                     trained_steps = ray.get(self.shared_storage.get_counter.remote())
                     beta = self.beta_schedule.value(trained_steps)
+                    print(f"[ReanalyzeWorker {self.rank}] run_loop: Start signal received. Requesting first batch_context_handle. Trained_steps: {trained_steps}, Beta: {beta}", flush=True)
                     buffer_context_handle = self.replay_buffer.prepare_batch_context.remote(self.config.batch_size, beta)
                 time.sleep(0.1)
                 continue
 
             # break
             trained_steps = ray.get(self.shared_storage.get_counter.remote())
+            print(f"[ReanalyzeWorker {self.rank}] run_loop: Current trained_steps: {trained_steps}", flush=True)
             if trained_steps >= self.config.training_steps + self.config.last_steps:
+                print(f"[ReanalyzeWorker {self.rank}] run_loop: Training complete. Exiting.", flush=True)
                 time.sleep(30)
                 break
 
@@ -502,12 +673,18 @@ class RemoteReanalyzeWorker(ReanalyzeWorker):
 
                 # obtain the context from replay buffer and prepare for next batch
                 buffer_context = ray.get(buffer_context_handle)
+                print(f"[ReanalyzeWorker {self.rank}] run_loop: Got buffer_context. Num games: {len(buffer_context[0]) if buffer_context and buffer_context[0] else 'N/A'}", flush=True)
+                print(f"[ReanalyzeWorker {self.rank}] run_loop: Calling make_batch...", flush=True)
+
                 transitions_collected = ray.get(self.replay_buffer.transitions_collected.remote())
                 beta = self.beta_schedule.value(trained_steps)
                 buffer_context_handle = self.replay_buffer.prepare_batch_context.remote(self.config.batch_size, beta)
 
                 batch_context = self.make_batch(buffer_context, transitions_collected)
+                print(f"[ReanalyzeWorker {self.rank}] run_loop: make_batch COMPLETED. Batch info (e.g., future_return): {batch_context[2][0] if batch_context and len(batch_context[2]) > 0 else 'N/A'}", flush=True) # Print some info from the batch
+
                 self.batch_storage.push(batch_context)
+                print(f"[ReanalyzeWorker {self.rank}] run_loop: PUSHED batch to batch_storage. Queue len approx: {self.batch_storage.get_len()}", flush=True) # Assuming get_len() is accurate
             else:
                 time.sleep(1)
 
@@ -539,5 +716,7 @@ class RemoteReanalyzeWorker(ReanalyzeWorker):
 
             game_id, game = ray.get(game_handle)
             game_handle = self.replay_buffer.prepare_game.remote()
+            print("HERE BEFORE UDPATE adfasdfasdfa")
             update_context = self.make_renalyze_update(game_id, game)
+            print("HERE AFTER UPDATE")
             self.replay_buffer.update_game_history.remote(update_context)

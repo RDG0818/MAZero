@@ -11,7 +11,7 @@ import torch
 from torch.cuda.amp import autocast as autocast
 from gymnasium.utils import seeding
 
-from core.mcts import SampledMCTS
+from core.mcts.tree_search.mcts_sampled import SearchOutput, SampledMCTS
 from core.config import BaseConfig
 from core.replay_buffer import ReplayBuffer
 from core.storage import SharedStorage
@@ -154,6 +154,10 @@ class DataWorker(object):
         num_envs = self.config.num_pmcts
         episodes_collected = 0
         transitions_collected = 0
+        true_num_agents = self.config.num_agents
+        agent_actions = np.full((num_envs, true_num_agents), -1, dtype=np.int32)
+        agent_search_outputs = [[None for _ in range(true_num_agents)] for _ in range(num_envs)]
+        entropies = [[0.0 for _ in range(true_num_agents)] for _ in range(num_envs)]
 
         with torch.no_grad():
             # play games until max episodes
@@ -164,11 +168,16 @@ class DataWorker(object):
                 sampled_tau = self.config.sampled_action_temperature_fn(trained_steps)
                 greedy_epsilon = self.config.eps_greedy_fn(trained_steps)
 
+                active_env_indices = [i for i in range(num_envs) if not self.dones[i]]
+
+                if not active_env_indices: # All envs might be done, break to avoid issues
+                    break
+
                 # update model
                 self._update_model_before_step()
 
                 # stack obs for model inference
-                stack_obs = [game_history.step_obs() for game_history in self.game_histories]
+                stack_obs = [self.game_histories[i].step_obs() for i in active_env_indices]
                 stack_obs = prepare_observation_lst(stack_obs, self.config.image_based)
                 if self.config.image_based:
                     stack_obs = torch.from_numpy(stack_obs).to(self.device).float() / 255.0
@@ -177,40 +186,115 @@ class DataWorker(object):
 
                 with autocast():
                     network_output = self.model.initial_inference(stack_obs)
-                legal_actions_lst = np.asarray([env.legal_actions() for env in self.envs])
+                legal_actions_lst = np.asarray([self.envs[i].legal_actions() for i in active_env_indices]) # Shape: (num_envs, num_agents, action_space_size)
 
-                search_results = SampledMCTS(self.config, self.np_random).batch_search(
-                    self.model, network_output, legal_actions_lst, self.device, add_noise=True, sampled_tau=sampled_tau)
-                roots_values = search_results.value
-                roots_sampled_visit_counts = search_results.sampled_visit_count
-                roots_sampled_actions = search_results.sampled_actions
-                roots_sampled_qvalues = search_results.sampled_qvalues
+                mcts_handler = SampledMCTS(self.config, self.np_random)
 
-                for i in range(num_envs):
-                    root_value = roots_values[i]
-                    pred_value = network_output.value[i].item()
-                    sampled_actions = roots_sampled_actions[i]
-                    # use MCTS policy after starting training, otherwise use random policy before starting training
-                    sampled_visit_counts = roots_sampled_visit_counts[i] if start_training else np.ones_like(roots_sampled_visit_counts[i])
-                    sampled_policy = sampled_visit_counts / np.sum(sampled_visit_counts)
-                    sampled_qvalues = roots_sampled_qvalues[i]
+                temp_agent_actions = np.full((len(active_env_indices), true_num_agents), -1, dtype=np.int32)
+                temp_entropies = np.zeros((len(active_env_indices), true_num_agents))
 
-                    # sample action from policy under sampled actions respectively
-                    action_pos, visit_entropy = select_action(
-                        sampled_visit_counts,
-                        temperature=temperature,
-                        deterministic=False,
-                        np_random=self.np_random
+                for agent_idx in range(true_num_agents):
+                    factor = None
+                    if agent_idx > 0:
+                        factor = temp_agent_actions[:, :agent_idx].copy()
+
+                    agent_k_output = mcts_handler.batch_search(
+                        model=self.model,
+                        network_output=network_output,
+                        current_agent_idx=agent_idx,
+                        factor=factor,
+                        true_num_agents=true_num_agents,
+                        legal_actions_lst=legal_actions_lst,
+                        device=self.device,
+                        add_noise=True,
+                        sampled_tau=sampled_tau
                     )
-                    action = sampled_actions[action_pos]
-                    action = eps_greedy_action(action, legal_actions_lst[i], greedy_epsilon)
+
+                    for active_env_local_idx, original_env_idx in enumerate(active_env_indices):
+                        # Since agent_k_output is batched, we slice for each env
+                        agent_search_outputs[original_env_idx][agent_idx] = SearchOutput(
+                            value=agent_k_output.value[active_env_local_idx:active_env_local_idx+1],
+                            marginal_visit_count=agent_k_output.marginal_visit_count[active_env_local_idx:active_env_local_idx+1],
+                            marginal_priors=agent_k_output.marginal_priors[active_env_local_idx:active_env_local_idx+1],
+                            sampled_actions=[agent_k_output.sampled_actions[active_env_local_idx]],
+                            sampled_visit_count=[agent_k_output.sampled_visit_count[active_env_local_idx]],
+                            sampled_pred_probs=[agent_k_output.sampled_pred_probs[active_env_local_idx]],
+                            sampled_beta=[agent_k_output.sampled_beta[active_env_local_idx]],
+                            sampled_beta_hat=[agent_k_output.sampled_beta_hat[active_env_local_idx]],
+                            sampled_priors=[agent_k_output.sampled_priors[active_env_local_idx]],
+                            sampled_imp_ratio=[agent_k_output.sampled_imp_ratio[active_env_local_idx]],
+                            sampled_pred_values=[agent_k_output.sampled_pred_values[active_env_local_idx]],
+                            sampled_mcts_values=[agent_k_output.sampled_mcts_values[active_env_local_idx]],
+                            sampled_rewards=[agent_k_output.sampled_rewards[active_env_local_idx]],
+                            sampled_qvalues=[agent_k_output.sampled_qvalues[active_env_local_idx]]
+                        )
+
+                        sampled_actions = agent_k_output.sampled_actions[active_env_local_idx]
+                        sampled_visit_counts = agent_k_output.sampled_visit_count[active_env_local_idx]
+                        single_agent_legal_actions = legal_actions_lst[active_env_local_idx, agent_idx, :]
+
+                        if not sampled_actions.size:
+                            legal_indices = np.where(single_agent_legal_actions == 1)[0]
+                            agent_action = self.np_random.choice(legal_indices) if legal_indices.size > 0 else 0
+                            visit_entropy_per_agent = 0.0
+                        else:
+                            action_pos, visit_entropy_per_agent = select_action(
+                                sampled_visit_counts,
+                                temperature=temperature,
+                                deterministic=False,
+                                np_random=self.np_random
+                            )
+                            agent_action = sampled_actions[action_pos, 0]
+                        
+                        # Epsilon-greedy
+                        agent_action = eps_greedy_action(
+                            agent_action,
+                            single_agent_legal_actions,
+                            greedy_epsilon
+                        )
+
+                        temp_agent_actions[active_env_local_idx, agent_idx] = agent_action
+                        temp_entropies[active_env_local_idx][agent_idx] = visit_entropy_per_agent
+
+                for active_env_local_idx, original_env_idx in enumerate(active_env_indices):
+                    agent_actions[original_env_idx, :] = temp_agent_actions[active_env_local_idx, :]
+                    entropies[original_env_idx] = np.mean(temp_entropies[active_env_local_idx, :]) if true_num_agents > 0 else 0
+                
+                for i in active_env_indices:
+                    
+                    action = agent_actions[i, :]
 
                     next_obs, reward, done, info = self.envs[i].step(action)
                     self.dones[i] = done
 
                     # store data
                     self.game_histories[i].store_transition(action, reward, next_obs, legal_actions_lst[i], self.last_model_index)
-                    self.game_histories[i].store_search_stats(root_value, pred_value, sampled_actions, sampled_policy, sampled_qvalues)
+                    
+                    root_value = agent_search_outputs[i][0].value[0]
+                    pred_value = network_output.value[active_env_indices.index(i)].item() # fix this apparently
+                    sampled_actions = action.reshape(1, true_num_agents)
+
+                    prob_action = 1.0
+                    agent_entropies = []
+                    for ag_idx in range(true_num_agents):
+                        ag_action = action[ag_idx]
+                        ag_so = agent_search_outputs[i][ag_idx]
+                        ag_visits = ag_so.marginal_visit_count[0, 0, :]
+                        curr_ag_entropy = 0.0
+                        if np.sum(ag_visits) > 0:
+                            prob_action_dist = ag_visits / np.sum(ag_visits)
+                            prob_action *= prob_action_dist[ag_action]
+                            curr_ag_entropy = -np.sum(prob_action_dist * np.log(prob_action_dist + 1e-9))
+                        elif self.config.action_space_size > 0:
+                            prob_action *= (1.0/self.config.action_space_size)
+                        agent_entropies.append(curr_ag_entropy)
+
+                    sampled_policy = np.array([prob_action])
+                    if agent_entropies: self.visit_entropies_lst[i] += np.mean(agent_entropies)
+
+                    sampled_qvalues = np.array([root_value])
+
+                    self.game_histories[i].store_search_stats(root_value, pred_value, sampled_actions, sampled_policy, sampled_qvalues) 
                     if self.config.use_priority:
                         self.pred_values_lst[i].append(pred_value)
                         self.search_values_lst[i].append(root_value)
@@ -218,7 +302,6 @@ class DataWorker(object):
                     # update logs
                     self.eps_steps_lst[i] += 1
                     self.eps_reward_lst[i] += reward
-                    self.visit_entropies_lst[i] += visit_entropy
                     self.model_index_lst[i] += self.last_model_index
                     if self.config.case in ['smac', 'gfootball']:
                         self.battle_won_lst[i] = info['battle_won']
@@ -245,6 +328,9 @@ class DataWorker(object):
                     elif len(self.game_histories[i]) > self.config.max_moves:
                         # discard this trajectory
                         self.reset_env(i)
+                
+                if episodes_collected >= num_envs :
+                    break 
 
         return transitions_collected
 
