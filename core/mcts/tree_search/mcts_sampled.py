@@ -35,9 +35,6 @@ class SampledMCTS(object):
         self,
         model: BaseNet,
         network_output: NetworkOutput,
-        current_agent_idx: int,
-        factor: np.ndarray,
-        true_num_agents: int,
         legal_actions_lst: np.ndarray = None,
         device: torch.device = None,
         add_noise: bool = False,
@@ -46,47 +43,41 @@ class SampledMCTS(object):
     ) -> SearchOutput:
         """Create a batch of root nodes from network_output and do MCTS in parallel.
         """
-    
-
         pb_c_base, pb_c_init, discount, rho, lam = self.config.pb_c_base, self.config.pb_c_init, self.config.discount, self.config.mcts_rho, self.config.mcts_lambda
         noise_alpha, noise_epsilon = self.config.root_dirichlet_alpha, self.config.root_exploration_fraction
-        num_agents, action_space_size, sampled_times = 1, self.config.action_space_size, self.config.sampled_action_times 
+        num_agents, action_space_size, sampled_times = self.config.num_agents, self.config.action_space_size, self.config.sampled_action_times
         batch_size = network_output.hidden_state.shape[0]
-
 
         batch_hidden_states = network_output.hidden_state           # (batch_size, state_hidden_size)
         batch_rewards = network_output.reward                       # (batch_size, 1)
         batch_values = network_output.value                         # (batch_size, 1)
-        batch_policy_logits = network_output.policy_logits[:, current_agent_idx, :] # Shape: (batch_size, action_space_size)
-        batch_policy_logits = batch_policy_logits.reshape(batch_size, 1, action_space_size) # Reshape for cytree
-        assert batch_values.shape == (batch_size, 1) and batch_policy_logits.shape == (batch_size, 1, action_space_size)
+        batch_policy_logits = network_output.policy_logits          # (batch_size, num_agents, action_space_size)
+        assert batch_values.shape == (batch_size, 1) and batch_policy_logits.shape == (batch_size, num_agents, action_space_size)
 
         batch_policy_probs = np.exp(batch_policy_logits - np.max(batch_policy_logits, axis=-1, keepdims=True))
         batch_policy_probs = batch_policy_probs / np.sum(batch_policy_probs, axis=-1, keepdims=True)
 
         # exploration noise
-        noises = self.np_random.dirichlet([noise_alpha] * action_space_size, batch_size).astype(np.float32).reshape(batch_size, 1, action_space_size)
+        noises = self.np_random.dirichlet([noise_alpha] * action_space_size, batch_size * num_agents).astype(np.float32).reshape(batch_size, num_agents, action_space_size)
         if not add_noise:
             noise_epsilon = 0.0
         
         # check if need legal action mask
         if legal_actions_lst is not None:
-            single_agent_legal_actions = legal_actions_lst[:, current_agent_idx, :].reshape(batch_size, 1, action_space_size)
-            batch_policy_probs *= single_agent_legal_actions
+            batch_policy_probs *= legal_actions_lst
             # avoid zero denominator when normalized
-            batch_policy_probs += single_agent_legal_actions * 1e-4
+            batch_policy_probs += legal_actions_lst * 1e-4
             assert ~(np.sum(batch_policy_probs, axis=-1) == 0).sum()
             batch_policy_probs = batch_policy_probs / np.sum(batch_policy_probs, axis=-1, keepdims=True)
 
-            noises *= single_agent_legal_actions
-            noises += single_agent_legal_actions * 1e-4
+            noises *= legal_actions_lst
+            noises += legal_actions_lst * 1e-4
             noises = noises / np.sum(noises, axis=-1, keepdims=True)
 
         # the data storage of hidden states: storing the states of all the tree nodes
         hidden_states_pool = [batch_hidden_states]         # type: List[torch.Tensor]
         # initialize MCTS tree
-
-        trees = cytree.Tree_batch(batch_size, 1, action_space_size, sampled_times, self.config.num_simulations, self.config.tree_value_stat_delta_lb, self.np_random.choice(256), rho, lam)
+        trees = cytree.Tree_batch(batch_size, num_agents, action_space_size, sampled_times, self.config.num_simulations, self.config.tree_value_stat_delta_lb, self.np_random.choice(256), rho, lam)
 
         # (a) prepare root node with re-sampled actions
         if sampled_actions_res is None:
@@ -94,7 +85,7 @@ class SampledMCTS(object):
             batch_beta = batch_beta ** (1 / sampled_tau)
             # mask policy_probs with legal_action_lst if given
             if legal_actions_lst is not None:
-                batch_beta *= single_agent_legal_actions
+                batch_beta *= legal_actions_lst
                 # avoid zero denominator when normalized
                 assert ~(np.sum(batch_beta, axis=-1) == 0).sum()
             batch_beta = batch_beta / np.sum(batch_beta, axis=-1, keepdims=True)
@@ -113,18 +104,10 @@ class SampledMCTS(object):
 
             for index_simulation in range(self.config.num_simulations):
                 batch_hidden_states = []
-                estimated_joint_action = np.zeros((batch_size, true_num_agents), dtype=np.int32)
-
-                if factor is not None:
-                    for prev_agent_k in range(current_agent_idx):
-                        estimated_joint_action[:, prev_agent_k] = factor[:, prev_agent_k] # Assuming factor is (batch_size, current_agent_idx)
 
                 # traverse to select actions for each root
                 hidden_state_index_x_lst, hidden_state_index_y_lst, batch_actions = \
                     trees.batch_selection(pb_c_base, pb_c_init, discount)
-                
-                single_agent_action = batch_actions.squeeze()
-                estimated_joint_action[:, current_agent_idx] = single_agent_action
 
                 # obtain the states for leaf nodes at the end of current simulation
                 for ix, iy in zip(hidden_state_index_x_lst, hidden_state_index_y_lst):
@@ -132,28 +115,16 @@ class SampledMCTS(object):
 
                 # convert search results into torch tensor
                 batch_hidden_states = torch.vstack(batch_hidden_states)
-
-                with autocast():
-                    batch_policy_logits_prior, _ = model.prediction(batch_hidden_states) # For agents i+1, i+2, ... N actions
-
-                if isinstance(batch_policy_logits_prior, torch.Tensor):
-                    batch_policy_logits_prior = batch_policy_logits_prior.cpu().numpy()
-
-                for future_agent_k in range(current_agent_idx + 1, true_num_agents):
-                    future_agent_logits = batch_policy_logits_prior[:, future_agent_k, :] # Shape: (batch_size, action_space_size)
-                    future_agent_action = np.argmax(future_agent_logits, axis=-1) # Shape: (batch_size,)
-                    estimated_joint_action[:, future_agent_k] = future_agent_action
-
-                estimated_joint_action = torch.from_numpy(estimated_joint_action).to(device)
+                batch_actions = torch.from_numpy(batch_actions).to(device)
 
                 # evaluation for leaf nodes
                 with autocast():
-                    network_output = model.recurrent_inference(batch_hidden_states, estimated_joint_action)
+                    network_output = model.recurrent_inference(batch_hidden_states, batch_actions)
 
                 batch_hidden_states = network_output.hidden_state       # (batch_size, state_hidden_size)
                 batch_rewards = network_output.reward                   # (batch_size, 1)
                 batch_values = network_output.value                     # (batch_size, 1)
-                batch_policy_logits = network_output.policy_logits[:, current_agent_idx, :].reshape(batch_size, 1, action_space_size)      # (batch_size, num_agents, action_space_size)
+                batch_policy_logits = network_output.policy_logits      # (batch_size, num_agents, action_space_size)
 
                 batch_policy_probs = np.exp(batch_policy_logits - np.max(batch_policy_logits, axis=-1, keepdims=True))
                 batch_policy_probs = batch_policy_probs / np.sum(batch_policy_probs, axis=-1, keepdims=True)    # type: np.ndarray
@@ -172,7 +143,6 @@ class SampledMCTS(object):
                                                  batch_rewards, batch_values, batch_policy_probs, batch_beta)
 
         # get target value/policy from MCTS results
-        
         roots_values = trees.get_roots_values()                             # (batch_size, )
 
         roots_marginal_visit_count = trees.get_roots_marginal_visit_count()  # (batch_size, num_agents, action_space_size)
