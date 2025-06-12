@@ -1,13 +1,13 @@
 #!/bin/bash
 
 env='smac'
-scenario='2s_vs_1sc'
-exp_name="2s_PIC"
+scenario='3m'
+exp_name="test"
 
 K=10
 N=100
 
-seeds=(0 1 2 3 4)
+seeds=(0)
 mcts_rhos=(0.75)
 awac_lambdas=(3)
 adv_clips=(3.0)

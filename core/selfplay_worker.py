@@ -11,7 +11,7 @@ import torch
 from torch.cuda.amp import autocast as autocast
 from gymnasium.utils import seeding
 
-from core.mcts import SampledMCTS
+from core.mcts import SampledMCTS, sequential_search
 from core.config import BaseConfig
 from core.replay_buffer import ReplayBuffer
 from core.storage import SharedStorage
@@ -178,13 +178,16 @@ class DataWorker(object):
                 with autocast():
                     network_output = self.model.initial_inference(stack_obs)
                 legal_actions_lst = np.asarray([env.legal_actions() for env in self.envs])
+                print("STARTING RUN")
+                print("StARTING RN")
+                print("HEREHERHERHEEHRE")
+                search_list = sequential_search(self.config, self.model, stack_obs, legal_actions_lst, self.device, add_noise=True, sampled_tau=sampled_tau)
+                final_so = search_list[-1]
 
-                search_results = SampledMCTS(self.config, self.np_random).batch_search(
-                    self.model, network_output, legal_actions_lst, self.device, add_noise=True, sampled_tau=sampled_tau)
-                roots_values = search_results.value
-                roots_sampled_visit_counts = search_results.sampled_visit_count
-                roots_sampled_actions = search_results.sampled_actions
-                roots_sampled_qvalues = search_results.sampled_qvalues
+                roots_values               = final_so.value
+                roots_sampled_visit_counts = final_so.sampled_visit_count
+                roots_sampled_actions      = final_so.sampled_actions
+                roots_sampled_qvalues      = final_so.sampled_qvalues
 
                 for i in range(num_envs):
                     root_value = roots_values[i]

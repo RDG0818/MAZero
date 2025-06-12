@@ -18,6 +18,9 @@ class GameConfig(BaseConfig):
         self.fc_reward_layers = [32]
         self.fc_value_layers = [32]
         self.fc_policy_layers = [32]
+        self.prefix_input_dim = self.num_agents
+        self.prefix_emb_dim = 32
+        self.agent_emb_dim = 16
         self.proj_hid = 128
         self.proj_out = 128
         self.pred_hid = 64
@@ -42,6 +45,9 @@ class GameConfig(BaseConfig):
             self.value_support.size,
             self.inverse_value_transform,
             self.inverse_reward_transform,
+            self.prefix_input_dim,
+            self.prefix_emb_dim,
+            self.agent_emb_dim,
             proj_hid=self.proj_hid,
             proj_out=self.proj_out,
             pred_hid=self.pred_hid,

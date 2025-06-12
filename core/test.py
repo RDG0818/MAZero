@@ -10,7 +10,7 @@ from gymnasium.utils import seeding
 
 from core.config import BaseConfig, Game
 from core.model import BaseNet
-from core.mcts import SampledMCTS
+from core.mcts import SampledMCTS, sequential_search
 from core.game import GameHistory
 from core.utils import select_action, prepare_observation_lst
 
@@ -81,8 +81,9 @@ def test(
             legal_actions_lst = np.asarray([env.legal_actions() for env in envs])
 
             if config.use_mcts_test:
-                search_results = SampledMCTS(config, np_random).batch_search(model, network_output, legal_actions_lst, device, False, 1.0)
-
+                sl = sequential_search(config, model, stack_obs, legal_actions_lst, device, False, 1.0)
+                final_so = sl[-1]
+                search_results = final_so
                 roots_sampled_visit_counts = search_results.sampled_visit_count
                 roots_sampled_actions = search_results.sampled_actions
             else:

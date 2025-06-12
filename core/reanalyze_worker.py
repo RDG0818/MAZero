@@ -9,7 +9,7 @@ from torch.cuda.amp import autocast as autocast
 from gymnasium.utils import seeding
 
 from core.config import BaseConfig
-from core.mcts import SampledMCTS
+from core.mcts import SampledMCTS, sequential_search
 from core.game import GameHistory
 from core.utils import prepare_observation_lst, concat_with_zero_padding, LinearSchedule
 
@@ -118,8 +118,9 @@ class ReanalyzeWorker(object):
             # concat the output slices after model inference
             legal_actions_lst = np.asarray(legal_actions_lst)
 
-            search_results = SampledMCTS(self.config, self.np_random).batch_search(self.model, network_output, legal_actions_lst, self.device, True, 1.0)
-            value_lst = search_results.value.flatten()
+            sl = sequential_search(self.config, self.model, value_obs_tensor, legal_actions_lst, self.device, True, 1.0)
+            final_so = sl[-1]
+            value_lst = final_so.value.flatten()
         # use the predicted values
         elif self.config.use_pred_value:
             value_lst = network_output.value.flatten()
@@ -258,8 +259,9 @@ class ReanalyzeWorker(object):
 
         legal_actions_lst = np.asarray(legal_actions_lst).reshape(B * (K + 1), N, A)
 
-        search_results = SampledMCTS(self.config, self.np_random).batch_search(
-            self.model, network_output, legal_actions_lst, self.device, add_noise=True, sampled_tau=1.0)
+        sl = sequential_search(self.config, self.model, policy_obs_tensor, legal_actions_lst, self.device, True, 1.0)
+        final_so = sl[-1]
+        search_results = final_so
 
         batch_sampled_actions_re, batch_sampled_masks_re = concat_with_zero_padding(search_results.sampled_actions, C)
         batch_sampled_masks_re[~np.asarray(policy_mask)] = False
@@ -422,8 +424,9 @@ class ReanalyzeWorker(object):
 
         legal_actions_lst = game.legal_actions
 
-        search_results = SampledMCTS(self.config, self.np_random).batch_search(
-            self.model, network_output, legal_actions_lst, self.device, add_noise=True, sampled_tau=1.0)
+        sl = sequential_search(self.config, self.model, policy_obs_tensor, legal_actions_lst, self.device, True, 1.0)
+        final_so = sl[-1]
+        search_results = final_so
 
         C = self.config.sampled_action_times
 

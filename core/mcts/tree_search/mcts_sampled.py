@@ -97,7 +97,26 @@ class SampledMCTS(object):
             trees.prepare(batch_rewards, batch_values, batch_policy_probs, batch_beta, sampled_times, noise_epsilon, noises)
         # (b) prepare root node with fixed actions set
         else:
-            raise NotImplementedError
+            fixed_prefixes = sampled_actions_res
+            batch_beta = batch_policy_probs * (1 - noise_epsilon) + noises * noise_epsilon
+            batch_beta = batch_beta ** (1.0 / sampled_tau)
+            if legal_actions_lst is not None:
+                batch_beta *= legal_actions_lst
+                # avoid zero denominator when normalized
+                assert ~(np.sum(batch_beta, axis=-1) == 0).sum()
+            batch_beta = batch_beta / np.sum(batch_beta, axis=-1, keepdims=True)
+            #    policy_probs has shape [B, N, A], same for beta
+            for agent_idx, prefix in enumerate(fixed_prefixes):
+                # prefix: shape [B, A], a distribution (or one-hot)
+                batch_policy_probs[:, agent_idx, :] = prefix
+                batch_beta[:, agent_idx, :]        = prefix
+
+            batch_rewards = batch_rewards.reshape(batch_size).astype(np.float32)
+            batch_values  = batch_values.reshape(batch_size).astype(np.float32)
+            batch_policy_probs = batch_policy_probs.astype(np.float32)
+            batch_beta   = batch_beta.astype(np.float32)
+
+            trees.prepare(batch_rewards, batch_values, batch_policy_probs, batch_beta, sampled_times, noise_epsilon, noises)
 
         with torch.no_grad():
             model.eval()    # ensure model.output datatype: np.ndarray
